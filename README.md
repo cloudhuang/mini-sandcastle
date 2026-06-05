@@ -36,6 +36,20 @@ This is a simplified, educational version of the [sandcastle](https://github.com
 | `src/utils/shutdown.ts` | Process shutdown registry for cleaning up sandboxes on SIGINT/SIGTERM |
 | `src/utils/prompt.ts` | Prompt file loader with `{{VARIABLE}}` substitution |
 
+### Tests
+
+| File | Purpose |
+|------|---------|
+| `src/providers/docker.test.ts` | Docker sandbox provider integration tests |
+| `src/utils/worktree.test.ts` | Git worktree creation and change-detection tests |
+| `test/readme.test.ts` | README structure and content assertions |
+
+### Scripts
+
+| File | Purpose |
+|------|---------|
+| `scripts/test-shutdown.ts` | Manual test for the shutdown registry signal handling |
+
 ### Agent Output Format
 
 Claude Code outputs JSON Lines (JSONL). Each line is a JSON object:
