@@ -18,7 +18,7 @@ This is a simplified, educational version of the [sandcastle](https://github.com
 ```
 ┌─────────────────┐     ┌──────────────┐     ┌─────────────────┐
 │   Git Worktree  │────▶│Docker Sandbox│────▶│  Claude Code    │
-│  (isolated branch)│    │ (container)  │     │  (agent)        │
+│(isolated branch)│    │ (container)  │     │  (agent)        │
 └─────────────────┘     └──────────────┘     └─────────────────┘
 ```
 
