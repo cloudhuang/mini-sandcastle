@@ -76,17 +76,17 @@ test("snapshot is isolated from host repo", () => {
 
 test("createSnapshot cleans up temp dir when git clone fails", () => {
     // 统计克隆前的快照临时目录数量
-    const before = existsSyncSnapshotDirs();
+    const before = countSnapshotDirs();
 
     // 不存在的仓库路径会导致 git clone 失败
     expect(() => createSnapshot(join(tmpdir(), "no-such-repo-xyz"))).toThrow();
 
     // 失败不应泄漏 mini-sandcastle-snapshot-* 目录
-    const leaked = existsSyncSnapshotDirs();
+    const leaked = countSnapshotDirs();
     expect(leaked).toBe(before);
 });
 
-function existsSyncSnapshotDirs(): number {
+function countSnapshotDirs(): number {
     return readdirSync(tmpdir()).filter((f) => f.startsWith("mini-sandcastle-snapshot-")).length;
 }
 
