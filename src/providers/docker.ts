@@ -9,10 +9,20 @@ import { registerShutdown } from "../utils/shutdown.js";
 
 /**
  * Docker 沙箱 Provider
- * 
+ *
  * sandcastle 实际代码参考: src/sandboxes/docker.ts
  * 关键差异：sandcastle 用 Effect 封装，我们这里用原始 Promise 便于理解
+ *
+ * 容器内 git 环境配置
+ * worktree 模式：GIT_DIR 指向挂载的主仓库 .git/worktrees/<name>，
+ * GIT_COMMON_DIR 共享主仓库 objects/refs；
+ * snapshot 模式：workspace 是完整 clone，GIT_DIR 即容器内 .git，无 common dir。
  */
+interface ContainerGitEnv {
+    readonly gitDir: string;
+    readonly commonDir?: string;
+}
+
 export const docker = (): SandboxProvider => ({
     name: "docker",
 
@@ -21,12 +31,21 @@ export const docker = (): SandboxProvider => ({
         const containerName = `mini-sandcastle-${randomUUID()}`;
         const imageName = "mini-sandcastle-image";
 
-        await dockerRun(containerName, imageName, options.repoDir, options.worktreePath, options.env);
+        await dockerRun(containerName, imageName, options);
 
-        // 计算容器内的 GIT_DIR：必须指向 worktree 自己的 admin 目录，
-        // 而不是主仓库 .git —— 否则容器内 git commit 会落到主仓库当前
-        // checkout 的分支上，彻底破坏多任务分支隔离
-        const gitDirInContainer = resolveContainerGitDir(options.worktreePath);
+        // 快照模式：不挂载任何宿主机代码目录，把快照内容拷入容器
+        if (options.snapshot) {
+            await dockerCp(options.worktreePath, containerName, "/home/agent/workspace");
+        }
+
+        // 计算容器内的 GIT_DIR：
+        // worktree 模式必须指向 worktree 自己的 admin 目录（而不是主仓库 .git），
+        // 否则容器内 git commit 会落到主仓库当前 checkout 的分支上，
+        // 彻底破坏多任务分支隔离；
+        // snapshot 模式的 workspace 是完整 clone，GIT_DIR 直接用容器内 .git
+        const gitEnv: ContainerGitEnv = options.snapshot
+            ? { gitDir: "/home/agent/workspace/.git" }
+            : { gitDir: resolveContainerGitDir(options.worktreePath), commonDir: "/home/agent/repo.git" };
 
         // 注册同步清理函数
         // 关键：信号处理器中只能用同步操作！
@@ -45,7 +64,7 @@ export const docker = (): SandboxProvider => ({
             worktreePath: "/home/agent/workspace",
 
             async exec(command, opts) {
-                return dockerExec(containerName, command, opts, gitDirInContainer);
+                return dockerExec(containerName, command, opts, gitEnv);
             },
 
             async close() {
@@ -57,29 +76,47 @@ export const docker = (): SandboxProvider => ({
 });
 
 /**
- * docker run -d --name <name> -v <worktree>:/home/agent/workspace <image>
+ * 宿主机的 UID/GID，用于 --user 运行容器
+ * 某些环境（如无 /etc/passwd 条目的容器）userInfo() 会抛 ENOENT，
+ * 回退到进程的 getuid()/getgid()
+ */
+function hostUidGid(): { uid: number; gid: number } {
+    try {
+        const { uid, gid } = userInfo();
+        return { uid, gid };
+    } catch {
+        return { uid: process.getuid?.() ?? 1000, gid: process.getgid?.() ?? 1000 };
+    }
+}
+
+/**
+ * docker run -d --name <name> [-v <worktree>:/home/agent/workspace [-v <repo>/.git:/home/agent/repo.git]] <image>
  *
  * 注意：镜像的 ENTRYPOINT 已经是 "sleep infinity"，这里不要再传命令，
  * 否则会拼接成 "sleep infinity sleep infinity" 导致容器启动失败。
+ *
+ * snapshot 模式下跳过 worktree 和 .git 挂载（无任何宿主机代码目录挂载），
+ * 代码由 create() 在容器启动后通过 docker cp 拷入。
  */
 async function dockerRun(
     name: string,
     image: string,
-    repoDir: string | undefined,
-    worktreePath: string,
-    env: Record<string, string>
+    options: CreateSandboxOptions
 ): Promise<void> {
     return new Promise((resolve, reject) => {
         const args = [
             "run",
             "-d",                    // 后台运行
             "--name", name,          // 指定容器名
-            "-v", `${worktreePath}:/home/agent/workspace`, // 代码挂载
         ];
 
-        // 挂载主仓库 .git，使容器内 git 能正确识别 worktree
-        if (repoDir) {
-            args.push("-v", `${repoDir}/.git:/home/agent/repo.git`);
+        if (!options.snapshot) {
+            args.push("-v", `${options.worktreePath}:/home/agent/workspace`); // 代码挂载
+
+            // 挂载主仓库 .git，使容器内 git 能正确识别 worktree
+            if (options.repoDir) {
+                args.push("-v", `${options.repoDir}/.git:/home/agent/repo.git`);
+            }
         }
 
         args.push("-v", `${homedir()}/.claude:/home/agent/.claude`); // 认证缓存挂载
@@ -90,12 +127,12 @@ async function dockerRun(
         args.push("-w", "/home/agent/workspace"); // 工作目录
 
         // 注入所有环境变量
-        for (const [key, value] of Object.entries(env)) {
+        for (const [key, value] of Object.entries(options.env)) {
             args.push("-e", `${key}=${value}`);
         }
 
         // 使用宿主机 UID/GID 运行容器，确保能读取挂载的认证文件（如 ~/.claude/.credentials.json）
-        const { uid, gid } = userInfo();
+        const { uid, gid } = hostUidGid();
         args.push("--user", `${uid}:${gid}`);
 
         args.push(image);
@@ -122,6 +159,36 @@ async function dockerRun(
 
         proc.on("error", (err) => {
             reject(new Error(`docker run error: ${err.message}`));
+        });
+    });
+}
+
+/**
+ * docker cp <srcDir>/. <container>:<dstDir>
+ *
+ * 快照模式的代码注入方式：容器启动后把快照目录内容拷入容器，
+ * 代替 worktree 模式的 bind mount，实现零宿主机代码挂载。
+ */
+async function dockerCp(srcDir: string, containerName: string, dstDir: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+        // 使用 spawn 数组参数，避免命令注入
+        const proc = spawn("docker", ["cp", `${srcDir}/.`, `${containerName}:${dstDir}`]);
+
+        let stderr = "";
+        proc.stderr?.on("data", (chunk) => {
+            stderr += chunk.toString();
+        });
+
+        proc.on("close", (code) => {
+            if (code === 0) {
+                resolve();
+            } else {
+                reject(new Error(`docker cp failed with code ${code}: ${stderr}`));
+            }
+        });
+
+        proc.on("error", (err) => {
+            reject(new Error(`docker cp error: ${err.message}`));
         });
     });
 }
@@ -165,7 +232,7 @@ async function dockerExec(
     containerName: string,
     command: string,
     opts?: ExecOptions,
-    containerGitDir: string = "/home/agent/repo.git"
+    containerGitEnv: ContainerGitEnv = { gitDir: "/home/agent/repo.git", commonDir: "/home/agent/repo.git" }
 ): Promise<ExecResult> {
     return new Promise((resolve, reject) => {
         const args = ["exec"];
@@ -181,10 +248,17 @@ async function dockerExec(
         }
 
         // 自动设置 GIT_DIR/GIT_WORK_TREE 等：
-        // GIT_DIR 指向 worktree admin 目录（HEAD = 任务分支），提交落到正确的分支
-        // GIT_COMMON_DIR 指向主 .git，共享 objects/refs
+        // GIT_DIR 指向 worktree admin 目录（HEAD = 任务分支），提交落到正确的分支；
+        // 快照模式下 GIT_DIR 指向容器内 .git（完整 clone），不设置 GIT_COMMON_DIR
         // GIT_CONFIG_* 隔离全局配置，防止沙箱中的 git 操作污染宿主机的 .git/config
-        const gitPrefix = `export GIT_DIR=${containerGitDir} GIT_COMMON_DIR=/home/agent/repo.git GIT_WORK_TREE=/home/agent/workspace GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null && `;
+        const gitVars = [
+            `GIT_DIR=${containerGitEnv.gitDir}`,
+            containerGitEnv.commonDir ? `GIT_COMMON_DIR=${containerGitEnv.commonDir}` : undefined,
+            "GIT_WORK_TREE=/home/agent/workspace",
+            "GIT_CONFIG_GLOBAL=/dev/null",
+            "GIT_CONFIG_SYSTEM=/dev/null",
+        ].filter((v): v is string => v !== undefined).join(" ");
+        const gitPrefix = `export ${gitVars} && `;
         const wrappedCommand = gitPrefix + command;
 
         // 支持超时：使用 timeout 命令包装（容器内 coreutils 提供）
