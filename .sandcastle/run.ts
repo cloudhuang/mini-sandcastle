@@ -100,13 +100,17 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   console.log(`\n=== Iteration ${iteration}/${MAX_ITERATIONS} ===\n`);
 
   // Phase 1: Plan
+  // Planner 只做只读分析（读 issues、输出 <plan> JSON），不需要分支和 worktree。
+  // 用快照沙箱运行：仓库 clone 到临时目录、docker cp 进容器、零宿主机代码挂载
+  // （认证缓存仍挂载，但仓库代码目录完全不接触宿主机），
+  // 结束后快照整个丢弃，不会留下 sandcastle/plan-N 分支或孤儿 worktree。
   const plan = await run({
     name: "Planner",
     repoDir,
-    branch: `sandcastle/plan-${iteration}`,
     agent: createAgent(),
     sandbox: docker(),
     prompt: loadPrompt(".sandcastle/plan-prompt.md"),
+    snapshot: true,
   });
 
   const planMatch = plan.stdout.match(/<plan>([\s\S]*?)<\/plan>/);
@@ -233,8 +237,9 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     publishPr(repoDir, issue);
   }
 
-  // 本轮 plan 分支是纯临时产物，直接清理
-  cleanupPlanBranch(repoDir, `sandcastle/plan-${iteration}`);
+  // Planner 运行在快照沙箱里，不会留下分支/worktree；
+  // 这里只需顺手清理可能残留的注册表记录
+  pruneStaleWorktrees(repoDir);
 }
 
 console.log("\nAll done.");
@@ -327,19 +332,3 @@ function publishPr(
   }
 }
 
-/**
- * 清理本轮的 plan 分支（纯临时产物，不应有提交）
- * 用 -d 兜底：如果 planner 意外留下了提交，分支会被保留以供检查
- */
-function cleanupPlanBranch(repoDir: string, branch: string): void {
-  try {
-    execFileSync("git", ["branch", "-d", branch], {
-      cwd: repoDir,
-      stdio: "pipe",
-    });
-    console.log(`  🧹 Deleted local branch: ${branch}`);
-  } catch {
-    console.warn(`  ⚠️  Plan branch kept (unmerged commits?): ${branch}`);
-  }
-  pruneStaleWorktrees(repoDir);
-}

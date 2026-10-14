@@ -3,12 +3,19 @@
  * sandcastle 实际代码参考: src/SandboxProvider.ts
  */
 export interface CreateSandboxOptions {
-    /** 宿主机上的 worktree 路径 */
+    /** 宿主机上的 worktree（或快照）路径 */
     readonly worktreePath: string;
-    /** 主仓库根目录（Docker provider 需要它来挂载 .git） */
+    /** 主仓库根目录（Docker provider 需要它来挂载 .git；snapshot 模式下不传） */
     readonly repoDir?: string;
     /** 注入到沙箱的环境变量 */
     readonly env: Record<string, string>;
+    /**
+     * 快照模式：worktreePath 是仓库的一次性副本，
+     * 容器内不挂载任何宿主机代码目录（代码通过 docker cp 拷入），
+     * 认证缓存（如 ~/.claude）仍挂载以便 Agent 登录。
+     * 关闭后由调用方删除副本。用于 Plan 等只读场景。
+     */
+    readonly snapshot?: boolean;
 }
 
 /**

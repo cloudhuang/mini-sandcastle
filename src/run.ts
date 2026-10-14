@@ -1,6 +1,7 @@
 import type { AgentProvider, SandboxProvider } from "./types.js";
 import { readFileSync } from "node:fs";
 import { createWorktree, removeWorktree, hasUncommittedChanges } from "./utils/worktree.js";
+import { createSnapshot, removeSnapshot } from "./utils/snapshot.js";
 
 /**
  * 运行选项
@@ -10,10 +11,21 @@ export interface RunOptions {
     readonly name?: string;
     readonly prompt: string;
     readonly repoDir: string;
-    readonly branch: string;
+    /**
+     * 任务分支；worktree 模式默认 sandcastle/run，
+     * snapshot 模式下不创建分支，此参数忽略
+     */
+    readonly branch?: string;
     readonly agent: AgentProvider;
     readonly sandbox: SandboxProvider;
     readonly baseBranch?: string;
+    /**
+     * 快照模式（Plan 阶段专用）：
+     * 不创建 worktree，而是把仓库 clone 到临时快照目录，
+     * 沙箱内不挂载任何宿主机代码目录（认证缓存除外），Agent 结束后快照整个丢弃。
+     * Agent 的产出仅是 stdout（如 <plan> JSON），不产生 commit。
+     */
+    readonly snapshot?: boolean;
 }
 
 /**
@@ -30,14 +42,24 @@ export interface RunResult {
  * 
  * 这是 sandcastle 最核心的编排逻辑简化版
  * sandcastle 实际代码参考: src/Orchestrator.ts (invokeAgent) + src/createSandbox.ts
+ *
+ * 两种模式：
+ * - worktree（默认）：创建分支 + worktree + bind mount，Agent 的 commit 落回任务分支
+ * - snapshot（Plan 等只读阶段）：临时 clone + docker cp，无宿主机挂载，产出只有 stdout
  */
 export async function run(options: RunOptions): Promise<RunResult> {
-    console.log(`\n🚀 Running agent on branch: ${options.branch}`);
+    if (options.snapshot) {
+        return runInSnapshot(options);
+    }
+
+    const branch = options.branch ?? "sandcastle/run";
+
+    console.log(`\n🚀 Running agent on branch: ${branch}`);
 
     // Step 1: 创建 worktree
     const worktree = createWorktree(
         options.repoDir,
-        options.branch,
+        branch,
         options.baseBranch
     );
 
@@ -54,48 +76,15 @@ export async function run(options: RunOptions): Promise<RunResult> {
             },
         });
 
-        // Step 3: 构建 Agent 命令
-        const printCmd = options.agent.buildPrintCommand({
-            prompt: options.prompt,
-        });
-
-        console.log(`   Agent: ${options.agent.name}`);
-        console.log(`   Command: ${printCmd.command.slice(0, 80)}...`);
-
-        // Step 4: 执行 Agent
-        // 收集纯文本输出（而非原始 JSON Lines），便于下游正则匹配
-        const textChunks: string[] = [];
-
-        // 执行 Agent（设置 10 分钟超时，避免 pi 等慢 agent 被中断）
-        const result = await sandbox.exec(printCmd.command, {
-            onLine: (line) => {
-                // 实时解析并显示
-                for (const event of options.agent.parseStreamLine(line)) {
-                    switch (event.type) {
-                        case "text":
-                            process.stdout.write(event.text);
-                            textChunks.push(event.text);
-                            break;
-                        case "tool_call":
-                            console.log(`\n   [Tool: ${event.name}] ${event.args}\n`);
-                            break;
-                        case "result":
-                            console.log(`\n   [Result] ${event.result}\n`);
-                            break;
-                    }
-                }
-            },
-            cwd: "/home/agent/workspace",
-            stdin: printCmd.stdin,
-            timeout: 600_000, // 10 分钟
-        });
+        // Step 3+4: 执行 Agent
+        const { stdout, exitCode } = await execAgent(sandbox, options);
 
         // Step 5: 提取 commits
         const commits = await getCommits(worktree.path);
 
         return {
-            stdout: textChunks.join(""),
-            exitCode: result.exitCode,
+            stdout,
+            exitCode,
             commits,
         };
     } finally {
@@ -111,6 +100,96 @@ export async function run(options: RunOptions): Promise<RunResult> {
             removeWorktree(worktree);
         }
     }
+}
+
+/**
+ * 快照模式运行（Plan 阶段）
+ *
+ * 与 worktree 模式的差异：
+ * 1. 不创建分支/worktree，而是把仓库 clone 到系统临时目录
+ * 2. 沙箱内不挂载任何宿主机代码目录（认证缓存除外，代码由 docker cp 拷入容器）
+ * 3. Agent 结束后快照整个删除，commits 恒为空
+ */
+async function runInSnapshot(options: RunOptions): Promise<RunResult> {
+    console.log(`\n🚀 Running agent in snapshot sandbox${options.name ? `: ${options.name}` : ""}`);
+
+    // Step 1: 创建一次性仓库快照（完整 clone，含可用的 .git）
+    const snapshot = createSnapshot(options.repoDir);
+
+    let sandbox: Awaited<ReturnType<SandboxProvider["create"]>> | undefined;
+
+    try {
+        // Step 2: 创建沙箱（snapshot: true —— 无宿主机代码挂载）
+        sandbox = await options.sandbox.create({
+            worktreePath: snapshot.path,
+            env: {
+                HOME: "/home/agent",
+                ...pickAgentEnvVars(),
+            },
+            snapshot: true,
+        });
+
+        // Step 3+4: 执行 Agent
+        const { stdout, exitCode } = await execAgent(sandbox, options);
+
+        // 快照模式不产 commit：Agent 的产出就是 stdout（如 <plan> JSON）
+        return {
+            stdout,
+            exitCode,
+            commits: [],
+        };
+    } finally {
+        // Step 5: 清理容器与快照
+        if (sandbox) {
+            await sandbox.close();
+        }
+        removeSnapshot(snapshot);
+    }
+}
+
+/**
+ * 在已创建的沙箱中执行 Agent 命令
+ * 收集纯文本输出（而非原始 JSON Lines），便于下游正则匹配
+ */
+async function execAgent(
+    sandbox: Awaited<ReturnType<SandboxProvider["create"]>>,
+    options: RunOptions,
+): Promise<{ stdout: string; exitCode: number }> {
+    // 构建 Agent 命令
+    const printCmd = options.agent.buildPrintCommand({
+        prompt: options.prompt,
+    });
+
+    console.log(`   Agent: ${options.agent.name}`);
+    console.log(`   Command: ${printCmd.command.slice(0, 80)}...`);
+
+    const textChunks: string[] = [];
+
+    // 执行 Agent（设置 10 分钟超时，避免 pi 等慢 agent 被中断）
+    const result = await sandbox.exec(printCmd.command, {
+        onLine: (line) => {
+            // 实时解析并显示
+            for (const event of options.agent.parseStreamLine(line)) {
+                switch (event.type) {
+                    case "text":
+                        process.stdout.write(event.text);
+                        textChunks.push(event.text);
+                        break;
+                    case "tool_call":
+                        console.log(`\n   [Tool: ${event.name}] ${event.args}\n`);
+                        break;
+                    case "result":
+                        console.log(`\n   [Result] ${event.result}\n`);
+                        break;
+                }
+            }
+        },
+        cwd: "/home/agent/workspace",
+        stdin: printCmd.stdin,
+        timeout: 600_000, // 10 分钟
+    });
+
+    return { stdout: textChunks.join(""), exitCode: result.exitCode };
 }
 
 /**
