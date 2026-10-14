@@ -8,9 +8,9 @@ import { join } from "node:path";
 import { runParallel } from "../src/run-parallel.js";
 import { execSync, execFileSync } from "node:child_process";
 import { loadDotEnv } from "../src/utils/env.js";
-import { removeWorktree, pruneStaleWorktrees, repairPollutedGitConfig } from "../src/utils/worktree.js";
+import { pruneStaleWorktrees, repairPollutedGitConfig } from "../src/utils/worktree.js";
 
-// 加载 .env（GH_TOKEN 等）——merge agent 依赖它关闭 issue / push
+// 加载 .env（GH_TOKEN 等）——容器内的 agent 需要它访问 GitHub
 loadDotEnv(process.cwd());
 
 const repoDir = process.cwd();
@@ -32,24 +32,6 @@ function createAgent(): AgentProvider {
 
   // 默认使用 pi
   return piAgent(model);
-}
-
-/**
- * 获取已经合并到 master 的分支列表
- */
-function getMergedBranches(): string[] {
-  try {
-    const output = execSync(
-      "git branch --merged master --format='%(refname:short)'",
-      {
-        cwd: repoDir,
-        encoding: "utf-8",
-      },
-    );
-    return output.trim().split("\n").filter(Boolean);
-  } catch {
-    return [];
-  }
 }
 
 /**
@@ -96,7 +78,6 @@ function getOpenIssues(): { number: number; title: string }[] {
   }
 }
 
-const mergedBranches = getMergedBranches();
 const openIssues = getOpenIssues();
 const openIssueNumbers = new Set(openIssues.map((i) => i.number));
 const processedIssueNumbers = new Set<number>();
@@ -142,8 +123,10 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
     issues: { number: number; title: string; branch: string }[];
   };
 
-  // 过滤掉已经关闭或本轮已处理的 issue
-  // 关键改进：不再只看分支是否合并，而是看 GitHub issue 是否仍 open
+  // 过滤掉已经关闭、本轮已处理、或已有 open PR 的 issue
+  // PR 是 issue 生命周期的终点：PR 合并时 GitHub 自动关闭 issue；
+  // 已有 open PR 的 issue 正在等人工审查，不重复实现
+  const openPRs = getOpenPullRequests();
   issues = issues.filter((issue) => {
     if (!openIssueNumbers.has(issue.number)) {
       console.log(`  ⏭️  #${issue.number} already closed on GitHub, skipping`);
@@ -155,12 +138,12 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
       );
       return false;
     }
-    if (mergedBranches.includes(issue.branch)) {
+    const existingPR = openPRs.find((p) => p.headRefName === issue.branch);
+    if (existingPR) {
       console.log(
-        `  ⚠️  #${issue.number} branch was merged but issue still open — will re-process`,
+        `  ⏭️  #${issue.number} already has open PR #${existingPR.number}, awaiting review — skipping`,
       );
-      // 分支已合并但 issue 仍 open，说明之前 merge 可能覆盖了修改
-      // 继续处理，让 Agent 重新修复
+      return false;
     }
     return true;
   });
@@ -237,113 +220,126 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
   }
 
   if (completedBranches.length === 0) {
-    console.log("No commits produced. Nothing to merge.");
+    console.log("No commits produced. Nothing to publish.");
     continue;
   }
 
-  // Phase 3: Merge
-  await run({
-    name: "Merger",
-    repoDir,
-    branch: "sandcastle/merge",
-    agent: createAgent(),
-    sandbox: docker(),
-    prompt: loadPrompt(".sandcastle/merge-prompt.md", {
-      BRANCHES: completedBranches.map((b) => `- ${b}`).join("\n"),
-      ISSUES: completedIssues
-        .map((i) => `- #${i.number}: ${i.title}`)
-        .join("\n"),
-    }),
-  });
+  // Phase 4: Publish — push 分支并创建 PR
+  // 不直接动 master：PR 是人类的审查关口，
+  // issue 由 GitHub 在 PR 合并时自动关闭（PR body 里的 Closes #N）
+  repairPollutedGitConfig(repoDir);
 
-  console.log("\nBranches merged.");
-
-  // Phase 4: Integrate — 把 merge 结果整合回 master 并清理已消费的分支
-  // merge agent 只在沙箱分支 sandcastle/merge 上工作；
-  // master 的整合是确定性的宿主机操作，无需 agent 参与
-  const integrated = integrateIntoMaster(repoDir);
-
-  if (integrated) {
-    // 整合成功后，本轮消费过的分支都可以安全删除
-    cleanupConsumedBranches(repoDir, [
-      "sandcastle/merge",
-      `sandcastle/plan-${iteration}`,
-      ...completedIssues.map((i) => i.branch),
-    ]);
+  for (const issue of completedIssues) {
+    publishPr(repoDir, issue);
   }
+
+  // 本轮 plan 分支是纯临时产物，直接清理
+  cleanupPlanBranch(repoDir, `sandcastle/plan-${iteration}`);
 }
 
 console.log("\nAll done.");
 
 /**
- * 把 sandcastle/merge 快进合并进 master
- * 快进失败（master 有并发提交）时退化为普通 merge；
- * 任何失败都保留分支，留给人工处理
+ * 获取当前 open 的 PR 列表（headRefName → PR）
+ * 用于防止重复处理：已有 open PR 的 issue 不再被重新实现
  */
-function integrateIntoMaster(repoDir: string): boolean {
-  // 整合前先修复可能被容器内 Agent 污染的 .git/config，
-  // 否则宿主机 git 命令全部失效（core.worktree 指向容器路径）
-  repairPollutedGitConfig(repoDir);
-
+function getOpenPullRequests(): { number: number; headRefName: string }[] {
   try {
-    // sandcastle/merge 上没有新提交就无需整合
-    const ahead = execFileSync(
-      "git",
-      ["rev-list", "--count", "master..sandcastle/merge"],
-      { cwd: repoDir, encoding: "utf-8" }
-    ).trim();
-    if (ahead === "0") {
-      console.log("\nmaster is already up to date, nothing to integrate.");
-      return true;
-    }
-
-    execFileSync("git", ["merge", "--ff-only", "sandcastle/merge"], {
+    const output = execSync("gh pr list --state open --json number,headRefName", {
       cwd: repoDir,
+      encoding: "utf-8",
     });
-    console.log(`\nmaster updated to sandcastle/merge.`);
-    return true;
+    return JSON.parse(output.trim()) as { number: number; headRefName: string }[];
   } catch {
-    // 快进失败：master 在本轮期间有新提交，做一次普通合并
-    try {
-      execFileSync("git", ["merge", "--no-edit", "sandcastle/merge"], {
-        cwd: repoDir,
-      });
-      console.log("\nmaster merged with sandcastle/merge.");
-      return true;
-    } catch {
-      console.warn(
-        "\n⚠️  Failed to integrate sandcastle/merge into master — branch preserved for manual review."
-      );
-      return false;
-    }
+    return [];
   }
 }
 
 /**
- * 删除本轮已消费的分支及其残留 worktree
- * 用 -d（只删除已合并分支）兜底，避免误删未合并的工作
+ * push 任务分支到 origin 并创建 PR
+ * 这是确定性的宿主机操作（用宿主机凭据，不依赖容器内 token 权限）
+ * PR body 带 "Closes #N"，合并时 GitHub 自动关闭 issue
+ * PR 创建成功后清理本地分支（远端分支随 PR 保留）
  */
-function cleanupConsumedBranches(repoDir: string, branches: string[]): void {
-  for (const branch of branches) {
-    // 先清残留 worktree 目录（Ctrl+C 中断等情况可能留下）
-    const worktreePath = join(
-      repoDir,
-      ".sandcastle",
-      "worktrees",
-      branch
+function publishPr(
+  repoDir: string,
+  issue: { number: number; title: string; branch: string },
+): void {
+  // 1. push 分支
+  try {
+    execFileSync("git", ["push", "origin", issue.branch], {
+      cwd: repoDir,
+      stdio: "pipe",
+    });
+    console.log(`  📤 Pushed: ${issue.branch}`);
+  } catch (err) {
+    console.warn(
+      `  ⚠️  Push failed for ${issue.branch}, local branch kept: ${err instanceof Error ? err.message : err}`,
     );
-    removeWorktree({ path: worktreePath, branch, repoDir });
+    return;
+  }
 
-    try {
-      execFileSync("git", ["branch", "-d", branch], {
-        cwd: repoDir,
-        stdio: "pipe",
-      });
-      console.log(`  🧹 Deleted branch: ${branch}`);
-    } catch {
-      // -d 对未合并分支会失败 —— 这是故意的保护，保留分支
-      console.warn(`  ⚠️  Branch not fully merged, kept: ${branch}`);
-    }
+  // 2. 创建 PR
+  const title = `${issue.title} (#${issue.number})`;
+  const body = [
+    `Automated fix for #${issue.number}: ${issue.title}`,
+    "",
+    "Produced by mini-sandcastle autonomous run (plan → implement → review).",
+    "Human review merges this PR; the issue closes automatically on merge.",
+    "",
+    `Closes #${issue.number}`,
+  ].join("\n");
+
+  try {
+    const url = execFileSync(
+      "gh",
+      [
+        "pr",
+        "create",
+        "--base",
+        "master",
+        "--head",
+        issue.branch,
+        "--title",
+        title,
+        "--body",
+        body,
+      ],
+      { cwd: repoDir, encoding: "utf-8" },
+    ).trim();
+    console.log(`  🔗 PR created: ${url}`);
+  } catch (err) {
+    console.warn(
+      `  ⚠️  PR creation failed for ${issue.branch} (may already exist): ${err instanceof Error ? err.message : err}`,
+    );
+    return;
+  }
+
+  // 3. PR 已挂在远端分支上，本地分支可以清理
+  try {
+    execFileSync("git", ["branch", "-D", issue.branch], {
+      cwd: repoDir,
+      stdio: "pipe",
+    });
+    console.log(`  🧹 Deleted local branch: ${issue.branch}`);
+  } catch {
+    // 忽略
+  }
+}
+
+/**
+ * 清理本轮的 plan 分支（纯临时产物，不应有提交）
+ * 用 -d 兜底：如果 planner 意外留下了提交，分支会被保留以供检查
+ */
+function cleanupPlanBranch(repoDir: string, branch: string): void {
+  try {
+    execFileSync("git", ["branch", "-d", branch], {
+      cwd: repoDir,
+      stdio: "pipe",
+    });
+    console.log(`  🧹 Deleted local branch: ${branch}`);
+  } catch {
+    console.warn(`  ⚠️  Plan branch kept (unmerged commits?): ${branch}`);
   }
   pruneStaleWorktrees(repoDir);
 }

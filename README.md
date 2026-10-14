@@ -35,6 +35,16 @@
 
 并行编排见 `src/run-parallel.ts`：手写信号量（`src/utils/semaphore.ts`）控制并发上限，`Promise.allSettled` 保证单任务失败不影响整批。
 
+## 完整循环（`.sandcastle/run.ts`）
+
+基于 GitHub issues 的自主循环（plan → implement → review → publish）：
+
+1. **Plan**：Agent 规划 open issues（`ready-for-agent` 标签），取无依赖的 issue 集合
+2. **Implement + Review**：每个 issue 在独立分支 `sandcastle/issue-N` 上实现，再由独立的 Review agent 审查
+3. **Publish（确定性宿主机操作）**：push 分支 → `gh pr create`（PR body 含 `Closes #N`）→ 清理本地分支
+4. **等待人工审查**：**runner 不直接合并 master、不直接关 issue**——PR 是人类的审查关口，合并 PR 时 GitHub 自动关闭对应 issue
+5. 已有 open PR 的 issue 在后续循环中自动跳过；所有 issue 都在等 PR 合并时循环自然退出
+
 ## 使用
 
 ```bash
