@@ -1,8 +1,9 @@
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { existsSync } from "node:fs";
+import { join } from "node:path";
 import type { SandboxProvider, SandboxHandle, CreateSandboxOptions, ExecOptions, ExecResult } from "../types.js";
 import { registerShutdown } from "../utils/shutdown.js";
 
@@ -22,6 +23,11 @@ export const docker = (): SandboxProvider => ({
 
         await dockerRun(containerName, imageName, options.repoDir, options.worktreePath, options.env);
 
+        // 计算容器内的 GIT_DIR：必须指向 worktree 自己的 admin 目录，
+        // 而不是主仓库 .git —— 否则容器内 git commit 会落到主仓库当前
+        // checkout 的分支上，彻底破坏多任务分支隔离
+        const gitDirInContainer = resolveContainerGitDir(options.worktreePath);
+
         // 注册同步清理函数
         // 关键：信号处理器中只能用同步操作！
         const removeContainerSync = () => {
@@ -39,7 +45,7 @@ export const docker = (): SandboxProvider => ({
             worktreePath: "/home/agent/workspace",
 
             async exec(command, opts) {
-                return dockerExec(containerName, command, opts);
+                return dockerExec(containerName, command, opts, gitDirInContainer);
             },
 
             async close() {
@@ -77,12 +83,20 @@ async function dockerRun(
         }
 
         args.push("-v", `${homedir()}/.claude:/home/agent/.claude`); // 认证缓存挂载
+        // Pi 的认证（auth.json，含 oauth 类型的凭据）也挂载进容器
+        if (existsSync(join(homedir(), ".pi"))) {
+            args.push("-v", `${homedir()}/.pi:/home/agent/.pi`);
+        }
         args.push("-w", "/home/agent/workspace"); // 工作目录
 
         // 注入所有环境变量
         for (const [key, value] of Object.entries(env)) {
             args.push("-e", `${key}=${value}`);
         }
+
+        // 使用宿主机 UID/GID 运行容器，确保能读取挂载的认证文件（如 ~/.claude/.credentials.json）
+        const { uid, gid } = userInfo();
+        args.push("--user", `${uid}:${gid}`);
 
         args.push(image);
 
@@ -113,6 +127,35 @@ async function dockerRun(
 }
 
 /**
+ * 解析容器内应使用的 GIT_DIR
+ *
+ * worktree 的 git admin 目录形如 <repo>/.git/worktrees/<name>，
+ * 其中的 HEAD 指向任务分支。把它挂载路径换算到容器内
+ * （主仓库 .git 已挂载到 /home/agent/repo.git），
+ * 容器内的 git add/commit 就会落到任务分支上。
+ *
+ * 如果 worktreePath 不是 git worktree（比如普通目录），回退到主 .git。
+ */
+function resolveContainerGitDir(worktreePath: string): string {
+    const FALLBACK = "/home/agent/repo.git";
+    try {
+        const adminDir = execFileSync(
+            "git",
+            ["-C", worktreePath, "rev-parse", "--absolute-git-dir"],
+            { encoding: "utf-8" }
+        ).trim();
+        // 形如 .../.git/worktrees/<name> 才是 worktree 的 admin 目录
+        if (/[\\/]worktrees[\\/][^\\/]+$/.test(adminDir)) {
+            const adminName = adminDir.split(/[\\/]/).pop()!;
+            return `/home/agent/repo.git/worktrees/${adminName}`;
+        }
+        return FALLBACK;
+    } catch {
+        return FALLBACK;
+    }
+}
+
+/**
  * docker exec <name> sh -c "<command>"
  * 
  * 关键设计：支持 onLine 回调实现流式输出
@@ -122,15 +165,10 @@ async function dockerExec(
     containerName: string,
     command: string,
     opts?: ExecOptions,
-    user?: string
+    containerGitDir: string = "/home/agent/repo.git"
 ): Promise<ExecResult> {
     return new Promise((resolve, reject) => {
         const args = ["exec"];
-
-        // --user: 指定运行用户
-        if (user) {
-            args.push("--user", user);
-        }
 
         // -i: 交互模式（支持 stdin）
         if (opts?.stdin !== undefined) {
@@ -142,7 +180,20 @@ async function dockerExec(
             args.push("-w", opts.cwd);
         }
 
-        args.push(containerName, "sh", "-c", command);
+        // 自动设置 GIT_DIR/GIT_WORK_TREE 等：
+        // GIT_DIR 指向 worktree admin 目录（HEAD = 任务分支），提交落到正确的分支
+        // GIT_COMMON_DIR 指向主 .git，共享 objects/refs
+        // GIT_CONFIG_* 隔离全局配置，防止沙箱中的 git 操作污染宿主机的 .git/config
+        const gitPrefix = `export GIT_DIR=${containerGitDir} GIT_COMMON_DIR=/home/agent/repo.git GIT_WORK_TREE=/home/agent/workspace GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null && `;
+        const wrappedCommand = gitPrefix + command;
+
+        // 支持超时：使用 timeout 命令包装（容器内 coreutils 提供）
+        const timeoutSec = opts?.timeout ? Math.ceil(opts.timeout / 1000) : 0;
+        if (timeoutSec > 0) {
+            args.push(containerName, "timeout", "-s", "KILL", `${timeoutSec}s`, "sh", "-c", wrappedCommand);
+        } else {
+            args.push(containerName, "sh", "-c", wrappedCommand);
+        }
 
         const proc = spawn("docker", args, {
             stdio: [
