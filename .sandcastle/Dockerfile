@@ -19,6 +19,9 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 # 安装 Claude Code CLI（通过 npm 以绕过 claude.ai 的地区限制）
 RUN npm install -g @anthropic-ai/claude-code
 
+# 安装 Pi coding agent CLI（默认 AGENT=pi）
+RUN npm install -g @earendil-works/pi-coding-agent
+
 # 对齐 UID/GID（避免权限问题）
 ARG AGENT_UID=1000
 ARG AGENT_GID=1000

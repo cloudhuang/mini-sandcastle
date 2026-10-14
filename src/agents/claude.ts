@@ -45,9 +45,18 @@ export const claudeCode = (model: string): AgentProvider => ({
         try {
             const obj = JSON.parse(line);
 
-            // 文本输出
+            // 文本输出（旧格式直接 text 类型）
             if (obj.type === "text" && typeof obj.text === "string") {
                 events.push({ type: "text", text: obj.text });
+            }
+
+            // assistant 消息中的文本（新格式 stream-json）
+            if (obj.type === "assistant" && Array.isArray(obj.message?.content)) {
+                for (const item of obj.message.content) {
+                    if (item.type === "text" && typeof item.text === "string") {
+                        events.push({ type: "text", text: item.text });
+                    }
+                }
             }
 
             // 工具调用（如 Bash、Read、Write）
@@ -56,7 +65,7 @@ export const claudeCode = (model: string): AgentProvider => ({
                 events.push({ type: "tool_call", name: obj.name, args });
             }
 
-            // 结果输出
+            // 结果输出（支持旧格式和新格式）
             if (obj.type === "result" && typeof obj.result === "string") {
                 events.push({ type: "result", result: obj.result });
             }

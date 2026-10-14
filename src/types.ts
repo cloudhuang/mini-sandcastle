@@ -16,7 +16,7 @@ export interface CreateSandboxOptions {
  * sandcastle 实际代码参考: src/SandboxProvider.ts (ExecOptions)
  */
 export interface ExecOptions {
-    /** 
+    /**
      * 逐行回调 - 关键设计！
      * 用于实时流式输出和 idle timeout 检测
      */
@@ -25,6 +25,8 @@ export interface ExecOptions {
     readonly cwd?: string;
     /** 通过 stdin 输入内容 */
     readonly stdin?: string;
+    /** 命令执行超时（毫秒），默认无限制 */
+    readonly timeout?: number;
 }
 
 /**
