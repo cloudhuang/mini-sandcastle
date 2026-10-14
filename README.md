@@ -45,6 +45,14 @@ docker build -t mini-sandcastle-image -f .sandcastle/Dockerfile .sandcastle
 npm run sandcastle
 ```
 
+通过环境变量选择 Agent 与模型（与 `.sandcastle/main.ts` 一致）：
+
+```bash
+AGENT=pi npm run sandcastle          # 默认：Pi Agent
+AGENT=claude npm run sandcastle      # Claude Code
+MODEL=kimi-for-coding npm run sandcastle  # 可选，指定模型
+```
+
 进程收到 SIGINT/SIGTERM 时，`src/utils/shutdown.ts` 的 Shutdown Registry 会同步清理所有容器（信号处理器中只能执行同步操作）。
 
 ## 已知坑：容器内 git 可能污染宿主机 `.git/config`
@@ -63,4 +71,10 @@ fatal: Invalid path '/System/Volumes/Data/home/agent': No such file or directory
 npm test         # vitest（worktree 测试无需 Docker；docker.test.ts 需要）
 npm run typecheck
 npm run build    # tsup
+```
+
+调试 Agent 事件流解析可用根目录的 `test-parse.mjs`（直接喂一行 JSON 给 `parseStreamLine` 观察输出）：
+
+```bash
+node test-parse.mjs
 ```
