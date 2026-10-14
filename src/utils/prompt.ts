@@ -26,6 +26,24 @@ export function loadPrompt(
 }
 
 /**
+ * 提取 stdout 中 <tag>...</tag> 包裹的内容块
+ *
+ * Agent 的完整 stdout 往往混杂思考过程与其他输出，
+ * runner 只取标签内的结构化内容：
+ * - Phase 1 Planner 的 <plan> JSON
+ * - Phase 5 PR Reviewer 的 <review> markdown
+ *
+ * 无匹配时返回 undefined（调用方决定是报错还是降级继续）
+ */
+export function extractTagBlock(
+    content: string,
+    tag: string
+): string | undefined {
+    const match = content.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`));
+    return match ? match[1].trim() : undefined;
+}
+
+/**
  * 内置参数
  */
 export function getBuiltinArgs(

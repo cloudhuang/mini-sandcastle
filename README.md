@@ -42,8 +42,9 @@
 1. **Plan**：Agent 规划 open issues（`ready-for-agent` 标签），取无依赖的 issue 集合
 2. **Implement + Review**：每个 issue 在独立分支 `sandcastle/issue-N` 上实现，再由独立的 Review agent 审查
 3. **Publish（确定性宿主机操作）**：push 分支 → `gh pr create`（PR body 含 `Closes #N`）→ 清理本地分支
-4. **等待人工审查**：**runner 不直接合并 master、不直接关 issue**——PR 是人类的审查关口，合并 PR 时 GitHub 自动关闭对应 issue
-5. 已有 open PR 的 issue 在后续循环中自动跳过；所有 issue 都在等 PR 合并时循环自然退出
+4. **AI PR Review（只读）**：对每个本轮新建的 PR，Reviewer agent 在**快照沙箱**（零宿主机代码挂载、零分支/worktree）里阅读 issue / PR diff / 源码，产出 `<review>` markdown；runner 提取后在宿主机上用 `gh pr review <N> --comment --body-file` 发成 PR comment。审查失败只警告、不打断循环。与第 2 步的分支内自审查互补：那一步在发布前改代码（commit），这一步审查已发布的 PR、只留 comment 供人工参考
+5. **等待人工审查**：**runner 不直接合并 master、不直接关 issue**——PR 是人类的审查关口，合并 PR 时 GitHub 自动关闭对应 issue
+6. 已有 open PR 的 issue 在后续循环中自动跳过；所有 issue 都在等 PR 合并时循环自然退出
 
 ## 使用
 
