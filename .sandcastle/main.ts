@@ -5,6 +5,9 @@ import type { AgentProvider } from "../src/types.js";
 import { run } from "../src/run.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { loadDotEnv } from "../src/utils/env.js";
+
+loadDotEnv(process.cwd());
 
 /**
  * 与 .sandcastle/run.ts 保持一致：
