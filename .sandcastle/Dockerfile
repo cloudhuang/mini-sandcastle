@@ -1,20 +1,19 @@
-# 使用 Node.js 22 (Debian Bookworm)
-FROM node:22-bookworm
+# 使用 Node.js 22 (Alpine，musl libc，体积约为 Debian 版的 1/4)
+FROM node:22-alpine
 
 # 安装基础工具
-RUN apt-get update && apt-get install -y \
+# - coreutils: busybox 的 timeout/sleep 语义与 GNU 有差异，
+#   docker.ts 依赖 `timeout -s KILL <N>s` 和 ENTRYPOINT 的 `sleep infinity`
+# - shadow: Alpine 没有 usermod/groupmod（默认只有 adduser/addgroup）
+RUN apk add --no-cache \
   git \
   curl \
   jq \
-  && rm -rf /var/lib/apt/lists/*
+  coreutils \
+  shadow
 
-# 安装 GitHub CLI
-RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-  | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
-  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-  | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
-  && apt-get update && apt-get install -y gh \
-  && rm -rf /var/lib/apt/lists/*
+# 安装 GitHub CLI（Alpine community 仓库）
+RUN apk add --no-cache github-cli
 
 # 安装 Claude Code CLI（通过 npm 以绕过 claude.ai 的地区限制）
 RUN npm install -g @anthropic-ai/claude-code
@@ -32,6 +31,6 @@ ENV PATH="/home/agent/.local/bin:/usr/local/bin:$PATH"
 
 WORKDIR /home/agent
 
-# 关键：sleep infinity 保持容器运行
+# 关键：sleep infinity 保持容器运行（GNU coreutils 支持 infinity）
 # sandcastle 通过 docker exec 向容器发送命令
 ENTRYPOINT ["sleep", "infinity"]
