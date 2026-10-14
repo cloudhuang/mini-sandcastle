@@ -47,8 +47,10 @@
 
 ## 使用
 
+前置要求：**Node.js >= 20**（开发环境为 Node.js 22，与 `.sandcastle/Dockerfile` 中的 `node:22` 镜像一致）、Docker Desktop。
+
 ```bash
-# 前置：Docker Desktop、构建沙箱镜像
+# 构建沙箱镜像
 docker build -t mini-sandcastle-image -f .sandcastle/Dockerfile .sandcastle
 
 # 单次运行（.sandcastle/main.ts 是一个完整示例）
