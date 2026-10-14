@@ -1,1 +1,13 @@
 node_modules/
+
+# pnpm 本地存储（体积大，不应入库）
+.pnpm-store/
+
+# 环境变量（包含 API key，绝不能提交）
+.env
+
+# macOS
+.DS_Store
+
+# 沙箱运行时产物（worktree、测试输出等）
+.sandcastle/worktrees/
