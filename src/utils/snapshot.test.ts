@@ -1,5 +1,5 @@
 import { test, expect, beforeEach } from "vitest";
-import { mkdtempSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
@@ -73,6 +73,22 @@ test("snapshot is isolated from host repo", () => {
 
     removeSnapshot(snapshot);
 });
+
+test("createSnapshot cleans up temp dir when git clone fails", () => {
+    // 统计克隆前的快照临时目录数量
+    const before = existsSyncSnapshotDirs();
+
+    // 不存在的仓库路径会导致 git clone 失败
+    expect(() => createSnapshot(join(tmpdir(), "no-such-repo-xyz"))).toThrow();
+
+    // 失败不应泄漏 mini-sandcastle-snapshot-* 目录
+    const leaked = existsSyncSnapshotDirs();
+    expect(leaked).toBe(before);
+});
+
+function existsSyncSnapshotDirs(): number {
+    return readdirSync(tmpdir()).filter((f) => f.startsWith("mini-sandcastle-snapshot-")).length;
+}
 
 test("snapshot restores origin URL from host repo", () => {
     const repo = createTestRepo();

@@ -28,7 +28,17 @@ export interface Snapshot {
 export function createSnapshot(repoDir: string): Snapshot {
     const path = mkdtempSync(join(tmpdir(), "mini-sandcastle-snapshot-"));
 
-    execFileSync("git", ["clone", "--quiet", repoDir, path]);
+    try {
+        execFileSync("git", ["clone", "--quiet", repoDir, path]);
+    } catch (error) {
+        // clone 失败时清理临时目录，避免泄漏
+        try {
+            rmSync(path, { recursive: true, force: true });
+        } catch {
+            // 忽略清理失败
+        }
+        throw error;
+    }
 
     try {
         const originUrl = execFileSync(
